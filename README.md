@@ -1,6 +1,5 @@
 # Atlas RAG
 
-混合检索与知识库服务。本版本基于 [Praxis-RAG / Standalone RAG MCP](https://github.com/Guan0923/Praxis-RAG) 改进，保留上游来源说明。展示名称为 Atlas RAG，保留 `mini-agent-rag-mcp` 包名、`rag_mcp` 模块名及 `rag-service` / `rag-mcp` 启动命令，以兼容现有环境。
 
 这是一个可独立安装和运行的 Agentic RAG 模组，不依赖 Mini-Agent Backend 或主前端。一个安装包提供两个进程：
 
