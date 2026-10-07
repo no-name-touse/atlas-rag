@@ -58,7 +58,7 @@ SEARCH_TOOL_SCHEMA: dict[str, object] = {
 
 
 def search_tool_definition() -> types.Tool:
-    """Describe the stable action space exposed to Mini-Agent."""
+    """Describe the stable search action exposed to an MCP Host."""
 
     return types.Tool(
         name="search",
@@ -113,7 +113,7 @@ def create_server(orchestrator: SearchExecutor | None = None) -> Server:
     """Create the MCP protocol adapter around one orchestrator instance."""
 
     resolved = orchestrator or build_default_orchestrator()
-    server = Server("mini-agent-rag")
+    server = Server("atlas-rag")
 
     @server.list_tools()
     async def list_tools() -> Sequence[types.Tool]:
@@ -153,7 +153,7 @@ async def run_stdio_server() -> None:
 
 
 def main() -> int:
-    """Console entry point used by Mini-Agent's external MCP manager."""
+    """Console entry point used by an external MCP Host such as Nexus Agent."""
 
     asyncio.run(run_stdio_server())
     return 0

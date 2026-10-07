@@ -1,4 +1,4 @@
-# Atlas RAG
+# Atlas RAG——混合检索与知识库服务
 
 混合检索与知识库服务。本版本基于 [Praxis-RAG / Standalone RAG MCP](https://github.com/Guan0923/Praxis-RAG) 改进，保留上游来源说明。展示名称为 Atlas RAG，保留 `mini-agent-rag-mcp` 包名、`rag_mcp` 模块名及 `rag-service` / `rag-mcp` 启动命令，以兼容现有环境。
 
@@ -16,6 +16,19 @@
 ```
 
 RAG 只返回证据，不生成最终回答。是否调用、是否改写查询、是否多跳检索以及如何组织答案，仍由 Agent 决定。
+
+## 项目定位
+
+Atlas RAG 是一个可独立部署的 Agentic RAG 服务，面向本地文档知识库提供从导入到检索的完整链路：有界文档解析与切分、BGE-M3 Dense Embedding、BM25 Sparse 检索、Qdrant 向量存储、RRF 混合召回和 Cross Encoder 重排。FastAPI 服务负责知识库和 HTTP API，轻量 `rag-mcp` 进程通过标准 stdio MCP 将同一套检索能力暴露给任意 MCP Host。
+
+与 Nexus Agent 的接入关系如下：Nexus 只负责启动 MCP 进程、发现 `search` 工具并把证据交给模型；Atlas 负责检索、租户 namespace 隔离和证据返回。检索结果带有 `evidence_status`、`source`、`title`、`chunk_id` 和分数，便于 Agent 生成可追溯回答，也能在没有证据时明确返回不足而不是猜测。
+
+```text
+知识文件 -> 解析/切分 -> BGE-M3 + BM25 -> Qdrant
+Nexus Agent -> stdio MCP -> rag-mcp -> HTTP -> rag-service -> 混合召回/重排/证据
+```
+
+这套边界使 Atlas 可以作为独立 RAG 项目运行，也可以作为 Nexus Agent 的外部知识工具复用；两边通过 MCP Schema 和 HTTP 契约协作，不共享模型加载和向量数据库进程。
 
 ## 安装
 
