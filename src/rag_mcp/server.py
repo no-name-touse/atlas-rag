@@ -1,22 +1,26 @@
-"""Expose the RAG orchestrator as a long-lived stdio MCP server."""
+"""Expose the RAG orchestrator through a shared MCP server definition."""
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from mcp import types
 from mcp.server import Server
-from mcp.server.stdio import stdio_server
+from mcp.server.lowlevel.server import NotificationOptions
 
-from .config import RagConfig, RagConfigError
+from . import __version__
+from .config import RagConfigError
 from .contracts import RagOperationError, SearchRequest, SearchValidationError
+from .catalog import NamespaceCatalog
 from .orchestrator import build_default_orchestrator
-from .remote import RemoteRagOrchestrator, RemoteRagSettings
+from .service_knowledge import KnowledgeError
 
 
 class SearchExecutor(Protocol):
@@ -36,7 +40,7 @@ SEARCH_TOOL_SCHEMA: dict[str, object] = {
         },
         "rerank": {
             "type": "string",
-            "enum": ["none", "cross_encoder", "bi_encoder"],
+            "enum": ["none", "cross_encoder"],
             "default": "cross_encoder",
         },
         "candidate_k": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10},
@@ -58,7 +62,7 @@ SEARCH_TOOL_SCHEMA: dict[str, object] = {
 
 
 def search_tool_definition() -> types.Tool:
-    """Describe the stable search action exposed to an MCP Host."""
+    """Describe the stable action space exposed to MCP clients."""
 
     return types.Tool(
         name="search",
@@ -69,12 +73,12 @@ def search_tool_definition() -> types.Tool:
             "If evidence_status is no_evidence, rewrite the query once when useful, otherwise say the knowledge "
             "base is insufficient. Do not use this tool for greetings or unrelated general tasks."
         ),
-        inputSchema=SEARCH_TOOL_SCHEMA,
+        input_schema=SEARCH_TOOL_SCHEMA,
         annotations=types.ToolAnnotations(
-            readOnlyHint=True,
-            destructiveHint=False,
-            idempotentHint=True,
-            openWorldHint=False,
+            read_only_hint=True,
+            destructive_hint=False,
+            idempotent_hint=True,
+            open_world_hint=False,
         ),
     )
 
@@ -85,21 +89,7 @@ def invoke_search(
 ) -> types.CallToolResult:
     """Validate one MCP call and render a JSON observation for the Agent."""
 
-    _trace("search validation started")
-    try:
-        request = SearchRequest.from_arguments(dict(arguments or {}))
-        _trace("orchestrator search started")
-        payload = orchestrator.search(request)
-        _trace("orchestrator search completed")
-    except (RagConfigError, RagOperationError, SearchValidationError, KeyError) as exc:
-        _trace(f"search failed: {type(exc).__name__}")
-        return types.CallToolResult(
-            content=[types.TextContent(type="text", text=str(exc))],
-            isError=True,
-        )
-    return types.CallToolResult(
-        content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))]
-    )
+    return create_registry(orchestrator).invoke("search", dict(arguments or {}))
 
 
 def _trace(message: str) -> None:
@@ -109,55 +99,114 @@ def _trace(message: str) -> None:
         print(f"[rag-mcp] {message}", file=sys.stderr, flush=True)
 
 
-def create_server(orchestrator: SearchExecutor | None = None) -> Server:
-    """Create the MCP protocol adapter around one orchestrator instance."""
-
-    resolved = orchestrator or build_default_orchestrator()
-    server = Server("atlas-rag")
-
-    @server.list_tools()
-    async def list_tools() -> Sequence[types.Tool]:
-        return [search_tool_definition()]
-
-    @server.call_tool(validate_input=False)
-    async def call_tool(name: str, arguments: dict[str, Any]) -> types.CallToolResult:
-        if name != "search":
-            return types.CallToolResult(
-                content=[types.TextContent(type="text", text=f"Unknown RAG tool: {name}")],
-                isError=True,
-            )
-        # Model inference and Qdrant's synchronous client must not block the
-        # MCP protocol event loop while it is servicing the stdio session.
-        return await asyncio.to_thread(invoke_search, resolved, arguments)
-
-    return server
+@dataclass(frozen=True)
+class RegisteredTool:
+    definition: types.Tool
+    validate: Callable[[dict[str, Any]], Any]
+    execute: Callable[[Any], dict[str, object] | Awaitable[dict[str, object]]]
 
 
-async def run_stdio_server() -> None:
-    """Run until the parent MCP client closes standard input."""
+class ToolRegistry:
+    def __init__(self, entries: list[RegisteredTool], catalog: NamespaceCatalog | None = None) -> None:
+        self.entries = {entry.definition.name: entry for entry in entries}
+        if len(self.entries) != len(entries):
+            raise ValueError("Duplicate tool name")
+        self.catalog = catalog
 
-    if os.getenv("RAG_SERVICE_URL", "").strip():
-        orchestrator: SearchExecutor = RemoteRagOrchestrator(RemoteRagSettings.from_env())
-        _trace("using remote RAG Service transport")
-    else:
-        config = RagConfig.from_env()
-        local_orchestrator = build_default_orchestrator(config)
-        if config.preload_model:
-            _trace("model preload started")
-            await asyncio.to_thread(local_orchestrator.warmup)
-            _trace("model preload completed")
-        orchestrator = local_orchestrator
-    server = create_server(orchestrator)
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, server.create_initialization_options())
+    def configured(self) -> list[dict[str, Any]]:
+        overrides = self.catalog.snapshot().tools if self.catalog else {}
+        return [
+            {
+                "name": name,
+                "enabled": True,
+                "description": entry.definition.description or "",
+                **overrides.get(name, {}),
+            }
+            for name, entry in self.entries.items()
+        ]
+
+    def definitions(self) -> list[types.Tool]:
+        return [
+            self.entries[item["name"]].definition.model_copy(update={"description": item["description"]})
+            for item in self.configured()
+            if item["enabled"]
+        ]
+
+    def invoke(self, name: str, arguments: dict[str, Any]) -> types.CallToolResult:
+        try:
+            if name not in {item.name for item in self.definitions()}:
+                raise SearchValidationError(f"Unknown or disabled RAG tool: {name}")
+            entry = self.entries[name]
+            request = entry.validate(arguments)
+            _trace("tool execution started")
+            payload = entry.execute(request)
+            _trace("tool execution completed")
+        except (RagConfigError, RagOperationError, SearchValidationError, KnowledgeError, KeyError) as exc:
+            _trace(f"tool failed: {type(exc).__name__}")
+            return types.CallToolResult(content=[types.TextContent(type="text", text=str(exc))], is_error=True)
+        return self.render(payload)
+
+    async def invoke_async(self, name: str, arguments: dict[str, Any]) -> types.CallToolResult:
+        entry = self.entries.get(name)
+        if entry is None or not inspect.iscoroutinefunction(entry.execute):
+            return await asyncio.to_thread(self.invoke, name, arguments)
+        try:
+            definitions = await asyncio.to_thread(self.definitions)
+            if name not in {item.name for item in definitions}:
+                raise SearchValidationError(f"Unknown or disabled RAG tool: {name}")
+            request = await asyncio.to_thread(entry.validate, arguments)
+            payload = await entry.execute(request)
+        except (RagConfigError, RagOperationError, SearchValidationError, KnowledgeError, KeyError) as exc:
+            return types.CallToolResult(content=[types.TextContent(type="text", text=str(exc))], is_error=True)
+        return self.render(payload)
+
+    @staticmethod
+    def render(payload: dict[str, object]) -> types.CallToolResult:
+        images = []
+        public_payload = json.loads(json.dumps(payload, ensure_ascii=False))
+        for result in public_payload.get("results", []):
+            asset = result.get("asset") if isinstance(result, dict) else None
+            if isinstance(asset, dict) and asset.get("type") == "image" and isinstance(asset.get("data"), str):
+                images.append(types.ImageContent(type="image", data=asset.pop("data"), mime_type=str(asset["mime_type"])))
+                asset["content_block"] = len(images)
+        return types.CallToolResult(content=[
+            types.TextContent(type="text", text=json.dumps(public_payload, ensure_ascii=False)), *images
+        ])
 
 
-def main() -> int:
-    """Console entry point used by an external MCP Host such as Nexus Agent."""
+def create_registry(executor: SearchExecutor, catalog: NamespaceCatalog | None = None, document_mutator=None) -> ToolRegistry:
+    entries = [RegisteredTool(search_tool_definition(), SearchRequest.from_arguments, executor.search)]
+    if document_mutator is not None:
+        from .document_tools import document_tool_entries
 
-    asyncio.run(run_stdio_server())
-    return 0
+        entries.extend(document_tool_entries(document_mutator))
+    return ToolRegistry(entries, catalog)
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+class RagServer(Server):
+    def get_capabilities(self, notification_options=None, experimental_capabilities=None, extensions=None, **kwargs):
+        return super().get_capabilities(
+            NotificationOptions(tools_changed=True, prompts_changed=True, resources_changed=True),
+            experimental_capabilities,
+            extensions,
+            **kwargs,
+        )
+
+
+def create_server(orchestrator: SearchExecutor | None = None, catalog=None, document_mutator=None, **handlers) -> Server:
+    registry = create_registry(orchestrator or build_default_orchestrator(), catalog, document_mutator)
+
+    async def list_tools(ctx, params) -> types.ListToolsResult:
+        return types.ListToolsResult(tools=await asyncio.to_thread(registry.definitions))
+
+    async def call_tool(ctx, params: types.CallToolRequestParams) -> types.CallToolResult:
+        # Cancelling the wait never terminates synchronous inference already running.
+        return await registry.invoke_async(params.name, params.arguments or {})
+
+    return RagServer(
+        "atlas-rag",
+        version=__version__,
+        on_list_tools=list_tools,
+        on_call_tool=call_tool,
+        **handlers,
+    )

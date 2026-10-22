@@ -3,6 +3,7 @@ __pycache__/
 *$py.class
 
 .pytest_cache/
+.test-tmp/
 .ruff_cache/
 .mypy_cache/
 .coverage
@@ -10,6 +11,7 @@ htmlcov/
 
 .venv/
 venv/
+.worktrees/
 
 build/
 dist/
@@ -24,3 +26,7 @@ dist/
 models/
 model-cache/
 qdrant_storage/
+
+# Frontend dependencies; compiled console assets are shipped with the Python package.
+frontend/node_modules/
+frontend/*.tsbuildinfo

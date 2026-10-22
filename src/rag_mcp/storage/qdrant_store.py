@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +63,9 @@ class QdrantStore:
         chunks: Sequence[DocumentChunk],
         vectors: Sequence[Sequence[float]],
         sparse_vectors: Sequence[SparseEmbedding] | None = None,
+        asset_payloads: Sequence[dict[str, object]] = (),
+        *,
+        after_write: Callable[[], None] | None = None,
     ) -> int:
         """Replace one document with dense and optional sparse vectors."""
 
@@ -81,11 +84,17 @@ class QdrantStore:
 
         self.ensure_collection()
         document_id = next(iter(document_ids))
-        self._client.delete(
-            collection_name=self.collection,
-            points_selector=models.FilterSelector(filter=_payload_filter(self._scoped({"document_id": document_id}))),
-            wait=True,
-        )
+        old_points = []
+        offset = None
+        while True:
+            page, offset = self._client.scroll(
+                collection_name=self.collection,
+                scroll_filter=_payload_filter(self._scoped({"document_id": document_id})),
+                offset=offset, limit=256, with_payload=True, with_vectors=True,
+            )
+            old_points.extend(page)
+            if offset is None:
+                break
         sparse_items: Sequence[SparseEmbedding | None]
         sparse_items = sparse_vectors if sparse_vectors is not None else [None] * len(chunks)
         points = []
@@ -98,6 +107,7 @@ class QdrantStore:
                     id=str(uuid.uuid5(_POINT_NAMESPACE, f"{self.namespace or ''}\0{chunk.chunk_id}")),
                     vector=point_vectors,
                     payload={
+                        "record_type": "chunk",
                         "document_id": chunk.document_id,
                         "chunk_id": chunk.chunk_id,
                         "text": chunk.text,
@@ -108,8 +118,93 @@ class QdrantStore:
                     },
                 )
             )
-        self._client.upsert(collection_name=self.collection, points=points, wait=True)
-        return len(points)
+        for payload in asset_payloads:
+            if payload.get("document_id") != document_id or not payload.get("asset_id"):
+                raise ValueError("Asset payload must belong to the replaced document")
+            points.append(models.PointStruct(
+                id=self._point_id(str(payload["asset_id"])), vector={},
+                payload={**payload, **({"namespace": self.namespace} if self.namespace else {})},
+            ))
+        try:
+            self._client.upsert(collection_name=self.collection, points=points, wait=True)
+            keep_ids = {str(point.id) for point in points}
+            stale = [point.id for point in old_points if str(point.id) not in keep_ids]
+            if stale:
+                self._client.delete(collection_name=self.collection,
+                                    points_selector=models.PointIdsList(points=stale), wait=True)
+            if after_write is not None:
+                after_write()
+        except Exception:
+            self._restore_document(old_points, [point.id for point in points])
+            raise
+        return len(chunks)
+
+    def reembed_into(self, collection: str, embedder, expected_chunks: dict[str, int]) -> None:
+        """Copy this namespace into an unpublished index, replacing only dense vectors."""
+        from collections import Counter
+
+        target = QdrantStore(collection=collection, vector_size=embedder.connection.vector_size,
+                             namespace=self.namespace, client=self._client)
+        target.ensure_collection()
+        copied = Counter()
+        offset = None
+        if self._client.collection_exists(self.collection):
+            while True:
+                points, offset = self._client.scroll(
+                    collection_name=self.collection, scroll_filter=_payload_filter(self._scoped({})),
+                    offset=offset, limit=64, with_payload=True, with_vectors=True,
+                )
+                chunks = [point for point in points if (point.payload or {}).get("record_type") == "chunk"]
+                vectors = embedder.embed_documents([point.payload["text"] for point in chunks])
+                dense = {str(point.id): vector for point, vector in zip(chunks, vectors, strict=True)}
+                replacements = []
+                for point in points:
+                    vector = dict(point.vector or {})
+                    if str(point.id) in dense:
+                        vector[DENSE_VECTOR_NAME] = dense[str(point.id)]
+                        copied[point.payload["document_id"]] += 1
+                    replacements.append(models.PointStruct(id=point.id, vector=vector, payload=point.payload))
+                if replacements:
+                    self._client.upsert(collection_name=collection, points=replacements, wait=True)
+                if offset is None:
+                    break
+        if dict(copied) != expected_chunks:
+            from ..contracts import RagOperationError
+            raise RagOperationError("文档清单与索引片段数量不一致，未切换模型；请检查现有索引")
+
+    def get_assets(self, asset_ids: Sequence[str]) -> dict[str, dict[str, object]]:
+        if not asset_ids:
+            return {}
+        self.ensure_collection()
+        points = self._client.retrieve(
+            collection_name=self.collection, ids=[self._point_id(value) for value in dict.fromkeys(asset_ids)],
+            with_payload=True, with_vectors=False,
+        )
+        result = {}
+        for point in points:
+            payload = dict(point.payload or {})
+            if payload.get("record_type") != "asset" or payload.get("namespace") != self.namespace:
+                continue
+            result[str(payload.get("asset_id"))] = payload
+        return result
+
+    def _point_id(self, item_id: str) -> str:
+        return str(uuid.uuid5(_POINT_NAMESPACE, f"{self.namespace or ''}\0{item_id}"))
+
+    def _restore_document(self, old_points: Sequence[Any], new_ids: Sequence[Any]) -> None:
+        old_ids = {str(point.id) for point in old_points}
+        introduced = [point_id for point_id in new_ids if str(point_id) not in old_ids]
+        try:
+            if old_points:
+                self._client.upsert(collection_name=self.collection, points=[
+                    models.PointStruct(id=point.id, vector=point.vector or {}, payload=dict(point.payload or {}))
+                    for point in old_points
+                ], wait=True)
+            if introduced:
+                self._client.delete(collection_name=self.collection,
+                                    points_selector=models.PointIdsList(points=introduced), wait=True)
+        except Exception as exc:
+            raise RuntimeError("Qdrant replacement failed and the previous index could not be restored") from exc
 
     def delete_document(self, document_id: str) -> None:
         """Delete every vector chunk belonging to one stable document id."""

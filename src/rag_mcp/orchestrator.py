@@ -6,7 +6,7 @@ from collections.abc import Callable, Mapping
 from time import perf_counter
 
 from .config import RagConfig
-from .contracts import Reranker, Retriever, SearchRequest
+from .contracts import Candidate, Reranker, Retriever, SearchRequest
 from .mock import MockReranker, MockRetriever
 
 
@@ -21,15 +21,17 @@ class RagOrchestrator:
         implementation: str,
         limitations: tuple[str, ...] = (),
         warmup: Callable[[], None] | None = None,
+        projector: Callable[[list[Candidate]], list[dict[str, object]]] | None = None,
     ) -> None:
         self._retrievers = dict(retrievers)
         self._rerankers = dict(rerankers)
         self._implementation = implementation
         self._limitations = limitations
         self._warmup = warmup
+        self._projector = projector
 
     def warmup(self) -> None:
-        """Prepare optional heavyweight dependencies before serving stdio."""
+        """Prepare optional heavyweight dependencies before serving requests."""
 
         if self._warmup is not None:
             self._warmup()
@@ -51,8 +53,13 @@ class RagOrchestrator:
             rerank_started = perf_counter()
             candidates = self._rerankers[request.rerank].rerank(request.query, candidates)
             rerank_ms = (perf_counter() - rerank_started) * 1_000
-        selected = candidates[: request.top_k]
+        selected = _unique_assets(candidates, request.top_k)
         evidence_status = "found" if selected else "no_evidence"
+        results = (
+            self._projector(selected)
+            if self._projector is not None
+            else [candidate.to_result(rank) for rank, candidate in enumerate(selected, start=1)]
+        )
         return {
             "query": request.query,
             "retrieval": request.retrieval,
@@ -65,16 +72,31 @@ class RagOrchestrator:
                 if selected
                 else "No supporting local evidence was found; do not guess or present unsupported knowledge claims."
             ),
-            "results": [candidate.to_result(rank) for rank, candidate in enumerate(selected, start=1)],
+            "results": results,
             "debug": {
                 "implementation": self._implementation,
                 "candidate_count": candidate_count,
-                "returned_count": len(selected),
+                "returned_count": len(results),
                 "retrieval_ms": round(retrieval_ms, 3),
                 "rerank_ms": round(rerank_ms, 3),
                 "limitations": list(self._limitations),
             },
         }
+
+
+def _unique_assets(candidates, limit: int):
+    selected = []
+    seen = set()
+    for candidate in candidates:
+        asset_id = candidate.metadata.get("asset_id")
+        key = ("asset", str(asset_id)) if asset_id else ("chunk", candidate.chunk_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append(candidate)
+        if len(selected) == limit:
+            break
+    return selected
 
 
 def build_default_orchestrator(config: RagConfig | None = None) -> RagOrchestrator:
@@ -89,7 +111,6 @@ def build_default_orchestrator(config: RagConfig | None = None) -> RagOrchestrat
         retrievers={"bm25": retriever, "embedding": retriever, "hybrid": retriever},
         rerankers={
             "cross_encoder": MockReranker("cross_encoder"),
-            "bi_encoder": MockReranker("bi_encoder"),
         },
         implementation="mock-v1",
         limitations=("All retrieval modes and rerankers are deterministic Phase-1 mocks.",),
@@ -149,9 +170,7 @@ def _build_qdrant_orchestrator(config: RagConfig) -> RagOrchestrator:
         },
         rerankers={
             "cross_encoder": cross_encoder,
-            "bi_encoder": MockReranker("bi_encoder"),
         },
         implementation="qdrant-hybrid-rerank-v1",
-        limitations=("bi_encoder remains a deterministic mock pending a measured need for a second reranker.",),
         warmup=warmup,
     )

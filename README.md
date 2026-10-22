@@ -1,202 +1,103 @@
-# Atlas RAG——混合检索与知识库服务
+# atlas-rag
 
+**面向 AI 助手和业务应用的独立知识库与检索服务。**
 
-这是一个可独立安装和运行的 Agentic RAG 模组，不依赖 Mini-Agent Backend 或主前端。一个安装包提供两个进程：
+atlas-rag 把分散的文档整理为可搜索、可追溯的知识库。你可以在网页中上传和管理资料，比较检索结果，也可以让 AI 助手通过 MCP 连接知识库，查找资料、读取正文和维护文档。
 
-- `rag-service`：拥有知识源文件、切分、Embedding、BM25、Qdrant、Reranking、HTTP API 和独立 Web Console。
-- `rag-mcp`：标准 stdio MCP 适配器；收到 Agent 的 `search` 调用时才连接 `rag-service`。
+它负责提供资料和出处，**不直接生成最终回答**。如何提问、是否继续查找、如何组织答案，由接入的 AI 助手或业务应用决定。
 
-```text
-浏览器 -> http://127.0.0.1:8011/console
-                         |
-任意 MCP Host -> rag-mcp |-> rag-service :8011 -> Qdrant :6333
-                         |
-                 同一个 namespace
-```
+## 适用场景
 
-RAG 只返回证据，不生成最终回答。是否调用、是否改写查询、是否多跳检索以及如何组织答案，仍由 Agent 决定。
+- **产品与售后知识库**：从手册、操作说明和故障记录中查找处理步骤，并返回对应资料。
+- **团队文档检索**：按工作区整理项目资料，让网页、AI 助手和业务系统访问同一份知识库。
+- **研究资料查阅**：检索 PDF 正文、表格、图片说明和公式，再对照原文核查。
+- **检索方案调试**：比较关键词检索、语义检索和混合检索，调整切分方式与结果排序。
 
-## 项目定位
+## 主要功能
 
-Atlas RAG 是一个可独立部署的 Agentic RAG 服务，面向本地文档知识库提供从导入到检索的完整链路：有界文档解析与切分、BGE-M3 Dense Embedding、BM25 Sparse 检索、Qdrant 向量存储、RRF 混合召回和 Cross Encoder 重排。FastAPI 服务负责知识库和 HTTP API，轻量 `rag-mcp` 进程通过标准 stdio MCP 将同一套检索能力暴露给任意 MCP Host。
+### 文档导入与管理
 
-与 Nexus Agent 的接入关系如下：Nexus 只负责启动 MCP 进程、发现 `search` 工具并把证据交给模型；Atlas 负责检索、租户 namespace 隔离和证据返回。检索结果带有 `evidence_status`、`source`、`title`、`chunk_id` 和分数，便于 Agent 生成可追溯回答，也能在没有证据时明确返回不足而不是猜测。
+支持 Markdown、TXT、PDF 和 Word（`.docx`、`.doc`，后者需 LibreOffice）。通过网页批量上传、查看和删除文档；相同内容与索引配置的重复上传可以跳过，减少重复处理。旧版 Word 索引在重新上传时重新解析，不会自动重建已有知识库。
 
-```text
-知识文件 -> 解析/切分 -> BGE-M3 + BM25 -> Qdrant
-Nexus Agent -> stdio MCP -> rag-mcp -> HTTP -> rag-service -> 混合召回/重排/证据
-```
+文档详情页支持文本阅读，以及 PDF 翻页、缩放和原文件下载。不同工作区分别管理文档，切换工作区后可继续浏览和检索对应资料。
 
-这套边界使 Atlas 可以作为独立 RAG 项目运行，也可以作为 Nexus Agent 的外部知识工具复用；两边通过 MCP Schema 和 HTTP 契约协作，不共享模型加载和向量数据库进程。
+### PDF 内容解析
 
-## 安装
+PDF 通过独立的本地 Docling 解析进程处理，支持电子版与扫描版文档：
 
-在本仓库中开发：
+- 提取正文和 OCR 识别文字，保留页码与来源位置。
+- 保存图片原图、表格结构和公式内容；公式转为 LaTeX。
+- 优先使用原始图注与表题，缺少有效说明时生成辅助检索描述。
+- 保存解析正文、结构记录和 OCR 警告，便于对照原文件检查。
 
-```powershell
-cd D:\project\Praxis-RAG
-uv sync --extra dense
-```
+解析结果不等于原文一定被准确还原。扫描质量、复杂版面、表格和公式都可能影响结果，重要内容仍需核对原页。
 
-作为独立工具安装当前目录：
+### 多种检索方式
 
-```powershell
-cd D:\project\Praxis-RAG
-uv tool install --editable ".[dense]"
-```
+| 方式 | 用途 |
+| --- | --- |
+| 关键词检索（BM25） | 查找型号、术语、故障码等明确词语。 |
+| 语义检索（Embedding） | 按含义查找相关内容，不要求提问与原文用词完全相同。 |
+| 混合检索（Hybrid） | 合并关键词与语义检索的候选结果。 |
+| 结果重排（Reranker，可选） | 对候选内容再次排序，优先展示与问题更相关的片段。 |
 
-从独立 Git 仓库直接安装：
+检索页展示内容片段、来源、分数和各阶段耗时，也支持三种检索方式并排比较。返回结果表示找到了候选资料，并不保证资料足以回答问题。
 
-```powershell
-uv tool install "mini-agent-rag-mcp[dense] @ git+https://github.com/Guan0923/xinghe_rag.git"
-```
+### 可调整的文档切分
 
-安装后，`rag-service`、`rag-mcp`、`rag-mcp-debug` 和 `rag-mcp-ingest` 都是独立命令。
+提供按字符、token、句子、递归和文档结构五种切分方式，并可调整片段长度与重叠量。你可以根据手册、短文或长篇资料的特点，选择合适的处理方式。
 
-## 启动
+PDF 的公式与表格行会按内容边界处理，减少在切分过程中拆散内容；超过模型输入上限时明确报错。
 
-### 1. 启动 Qdrant
+### 接入 AI 助手与业务系统
 
-```powershell
-docker run -d --name mini-agent-qdrant -p 6333:6333 -p 6334:6334 -v mini_agent_qdrant_data:/qdrant/storage qdrant/qdrant:latest
-```
+同一个服务提供三种入口，无需另外部署前端服务：
 
-容器已经创建过时执行：
+| 入口 | 能力 |
+| --- | --- |
+| Web Console：`/console` | 文档管理、检索调试、工作区切换和模型连接配置。 |
+| MCP：`/mcp` | 搜索、添加、更新和删除文档，分页读取正文，使用提示词模板及订阅变更。 |
+| REST API：`/v1/*` | 将知识管理与检索接入现有应用；交互式接口文档位于 `/docs`。 |
 
-```powershell
-docker start mini-agent-qdrant
-```
+管理员可以启停已注册的 MCP 工具、调整工具说明和管理提示词模板。文档写入与删除工具应只向可信客户端开放。
 
-### 2. 启动 RAG Service 和独立前端
+### 独立部署与模型连接
 
-```powershell
-$env:RAG_BACKEND = "qdrant"
-$env:QDRANT_URL = "http://127.0.0.1:6333"
-$env:RAG_COLLECTION = "mini_agent_phase3_hybrid"
-$env:RAG_EMBEDDING_DEVICE = "cpu"
-$env:RAG_RERANKER_DEVICE = "cpu"
-$env:RAG_SERVICE_DATA_ROOT = "$HOME/.mini_agent-rag"
+atlas-rag 不依赖其他 Agent 项目，可独立安装和运行。Qdrant 保存检索索引；文档及解析产物保存在服务的数据目录中。
 
-rag-service
-```
+语义检索和重排分别连接模型 API，可使用不同提供方，也可连接自行部署的本地推理服务。HTTP 服务本身不加载这两类模型的权重；PDF 解析仍需要单独准备本地环境和模型。
 
-仓库开发环境中也可以执行：
+**数据是否离开本机取决于你的模型配置。** 使用远程模型 API 时，查询和相关文档内容会发送给对应服务，测试连接也会发出真实模型请求，可能产生费用。
 
-```powershell
-uv run --package mini-agent-rag-mcp rag-service
-```
+## 使用流程
 
-默认地址：
+1. 安装 atlas-rag，准备 Qdrant，并按需配置 PDF 解析环境。
+2. 启动 `atlas-rag`，打开 `http://127.0.0.1:8011/console`。
+3. 在“连接配置”中填写并测试模型 API，选择工作区。
+4. 上传文档，在“检索调试”中检查返回内容与来源。
+5. 将同一工作区接入 MCP 客户端或业务系统。
 
-- Web Console：`http://127.0.0.1:8011/console`
-- OpenAPI：`http://127.0.0.1:8011/docs`
-- 健康检查：`http://127.0.0.1:8011/health`
+服务启动时优先读取 `~/.atlas-rag/config.toml`；该文件不存在时，会继续使用已有的 `~/.praxis-rag/config.toml` 和原数据目录。全新安装会创建新配置，知识文件默认保存在 `~/.atlas-rag/data/`。已有知识库数据不会自动搬迁。
 
-Console 包含知识上传、文档删除、BM25/Embedding/Hybrid 检索、Reranker 切换、Top-K 结果、score、source、chunk_id 和阶段耗时。它直接访问同源 RAG API，不经过 Mini-Agent。调试页还提供“三模式对比”，固定关闭重排并并排展示三种 Retriever 的原始结果，避免 Cross Encoder 把不同召回重新排成相同顺序。
+安装步骤、配置文件、模型接口要求和接入示例见 [使用与部署指南](docs/USAGE.md)。
 
-首次上传或 Dense 检索时会下载并加载 BGE-M3。上传后会自动提取文本、切分，并把 Dense Vector 与 BM25 Sparse Vector 写入 Qdrant。目前支持 UTF-8 `.md`/`.txt`、带文本层的 `.pdf` 和现代 Word `.docx`，每批最多 10 个文件，单文件最大 10 MiB。
+## 使用边界
 
-PDF 最多解析 1000 页；DOCX 解压后的内部文件总量最多 50 MiB；单个文档最多提取 500 万字符。扫描版 PDF 没有文本层，需要先用 OCR 软件转换；旧版二进制 `.doc` 需要先另存为 `.docx`。
+- 当前支持单进程、单 worker；上传与索引是同步操作，大文件处理期间需要等待。
+- 每批最多上传 10 个文件，单文件最大 10 MiB。暂不支持 Excel、网页抓取和独立图片上传。
+- Word 保留内容控件、嵌套表格、空列、合并范围和原生公式；图片按原字节返回。未知公式结构、原生图表和 OLE 等无法可靠读取的内容明确拒绝入库；图表关联有歧义时按规则跳过并显示原因。配置与限制见 [Word 解析说明](docs/USAGE.md#word-解析和图片检索)。
+- 工作区用于划分知识库，不是用户级权限系统。目前没有账户体系或细粒度多用户授权。
+- 默认仅监听本机。远程部署需要配置访问令牌、允许访问的域名与来源，并在服务前设置 HTTPS 和访问控制。
+- 订阅通知不提供历史重放或断线补发，重新连接后需要读取最新状态。
 
-## Namespace
+## 项目文档
 
-namespace 是一个独立知识库标识，例如 `default`、`product-manuals` 或 `team-a`。Console 与 MCP 配置必须使用相同值，否则 Agent 检索不到网页上传的文档。
+| 文档 | 内容 |
+| --- | --- |
+| [使用与部署](docs/USAGE.md) | 安装、启动、模型配置、MCP 与 REST 接入、开发和测试。 |
+| [验证记录](VALIDATION.md) | 已执行的验证及其覆盖范围。 |
+| [PDF 验证记录](benchmarks/PDF_VALIDATION.md) | PDF 解析实测结果与未解决样例。 |
+| [Word 验证记录](benchmarks/WORD_VALIDATION.md) | DOC/DOCX、图片检索、表格和浏览器实测结果及限制。 |
+| [历史开发记录](PROGRESS.md) | 项目早期开发阶段记录，不作为当前功能清单。 |
 
-允许 1～64 个字符，只能包含字母、数字、点、下划线和横线。知识源文件位于：
-
-```text
-~/.mini_agent-rag/<namespace>/knowledge/
-~/.mini_agent-rag/<namespace>/manifest.json
-```
-
-namespace 不在 Agent 可见的工具 Schema 中；它由 MCP 进程配置并通过 Header 发送给服务。
-
-## 接入任意 stdio MCP Host
-
-通用配置：
-
-```toml
-[servers.rag]
-command = "rag-mcp"
-enabled = true
-
-[servers.rag.env]
-RAG_SERVICE_URL = "http://127.0.0.1:8011"
-RAG_NAMESPACE = "default"
-```
-
-Mini-Agent 使用相同的用户级 `mcp/servers.toml` 配置。开启其 `capabilities.mcp=true` 后新建 Agent run，即会通过通用 MCP 加载器发现工具；Mini-Agent 没有 RAG 专用路由或内置 RAG ToolSpec。
-
-MCP 内部工具名为 `search`。若 Host 使用 `rag` 作为 server 名，展示名通常是 `mcp_rag_search`。
-
-工具输入：
-
-```json
-{
-  "query": "星河 X7 出现 E03 应该怎么处理？",
-  "retrieval": "hybrid",
-  "rerank": "cross_encoder",
-  "candidate_k": 10,
-  "top_k": 5,
-  "filters": {}
-}
-```
-
-允许的 filter 只有 `document_id`、`source` 和 `title`，不接受原始 Qdrant Filter。
-
-## Token 与远程部署
-
-默认只监听 loopback。绑定非 loopback 地址时必须设置 Token：
-
-```powershell
-$env:RAG_SERVICE_HOST = "0.0.0.0"
-$env:RAG_SERVICE_TOKEN = "replace-with-a-random-secret"
-rag-service
-```
-
-MCP 配置不要保存明文密钥：
-
-```toml
-[servers.rag.env]
-RAG_SERVICE_URL = "https://rag.example.com"
-RAG_NAMESPACE = "product-manuals"
-
-[servers.rag.env_refs]
-RAG_SERVICE_TOKEN = "env://RAG_SERVICE_TOKEN"
-```
-
-Console 的 Token 只保存到浏览器 `sessionStorage`。生产环境还应在 RAG Service 前配置 HTTPS、访问控制和请求大小限制。
-
-## 本地直连模式
-
-不配置 `RAG_SERVICE_URL` 时，`rag-mcp` 仍可在自己的进程中直接加载模型和连接 Qdrant，用于兼容或单进程部署。推荐日常使用远程适配模式，以避免 MCP Host 重复加载重模型：
-
-```text
-推荐：rag-mcp --HTTP--> rag-service --模型/Qdrant
-兼容：rag-mcp ----------> 模型/Qdrant
-```
-
-## 开发与验证
-
-```powershell
-uv run --no-sync python -m pytest rag_mcp/tests -q
-uv run --no-sync python -m ruff check rag_mcp
-uv run --package mini-agent-rag-mcp rag-mcp-debug "RRF 怎么融合 BM25 和 Dense？"
-uv run --package mini-agent-rag-mcp rag-mcp-debug --schema
-```
-
-`rag-mcp` 是 stdio 服务，手工运行后等待 MCP 客户端输入、终端看起来没有输出是正常现象。浏览器调试应使用独立 Console。
-
-## 当前限制
-
-- 文档解析支持 Markdown/TXT、文本型 PDF 和 DOCX；旧版 `.doc`、Excel、网页抓取和图片 OCR 尚未实现。
-- 扫描版 PDF 当前不会自动 OCR，会返回明确提示；请先生成可搜索文本层后再上传。
-- `embedding` 使用 BGE-M3，默认 1024 维。
-- `hybrid` 使用 Qdrant Dense + Sparse 预取和 RRF 融合。
-- `cross_encoder` 使用真实 BGE Reranker；`bi_encoder` 仍是确定性 Mock。
-- Console 会同时展示 Cross Encoder 最终分数和重排前的 `retrieval_score`；请求失败时会清空旧结果并保留错误面板。
-- Cross Encoder 默认延迟加载。若首次调用因模型源网络不可达而失败，可先选择“不重排”或“三模式对比”验证召回，再准备本地模型缓存并重启服务。
-- 上传目前是同步请求，大文件索引期间网页会等待。
-- Console 用于本地开发调试，不提供账户系统或细粒度多用户权限。
-
-历史阶段和本轮变更记录见 [PROGRESS.md](PROGRESS.md)。
+产品名与 Python 安装包名均为 **atlas-rag**，主启动命令为 `atlas-rag`。原有 `rag-service`、`rag-mcp-debug`、`rag-mcp-ingest` 和 `rag-service-migrate` 命令仍可使用，内部模块为 `rag_mcp`。环境变量、API 路径和现有数据库集合名保持兼容。

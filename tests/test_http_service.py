@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import io
+from html.parser import HTMLParser
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
-from rag_mcp.config import RagConfig
+from rag_mcp.config import RagConfig, RagConfigError
 from rag_mcp.http_service import RagHttpSettings, create_service_app
 from rag_mcp.migrate import discover_legacy_sources, namespace_for_legacy_user
+from rag_mcp.model_api import ModelConnection
 from rag_mcp.service_knowledge import (
     IndexedDocument,
     KnowledgeDocumentStore,
@@ -28,15 +29,16 @@ class FakeRuntime:
         self.documents: dict[str, list[dict[str, object]]] = {}
         self.calls: list[tuple[str, str]] = []
         self.search_arguments: list[dict[str, object]] = []
+        self.search_result: dict[str, object] | None = None
 
     def status(self) -> dict[str, object]:
-        return {"status": "ok", "service": "rag-mcp-service", "collection": "test_hybrid"}
+        return {"status": "ok", "service": "atlas-rag", "collection": "test_hybrid"}
 
     def list_documents(self, namespace: str) -> list[dict[str, object]]:
         self.calls.append(("list", namespace))
         return list(self.documents.setdefault(namespace, []))
 
-    def upload(self, namespace: str, items: list[tuple[str, object]]) -> dict[str, object]:
+    def upload(self, namespace: str, items: list[tuple[str, object]], chunking=None) -> dict[str, object]:
         self.calls.append(("upload", namespace))
         imported = []
         for name, readable in items:
@@ -61,7 +63,7 @@ class FakeRuntime:
     def search(self, namespace: str, arguments: dict[str, object]) -> dict[str, object]:
         self.calls.append(("search", namespace))
         self.search_arguments.append(arguments)
-        return {"query": arguments["query"], "evidence_status": "no_evidence", "results": []}
+        return self.search_result or {"query": arguments["query"], "evidence_status": "no_evidence", "results": []}
 
 
 @pytest.fixture()
@@ -77,10 +79,29 @@ def test_health_is_available_without_tenant_credentials(service) -> None:
     response = client.get("/health")
 
     assert response.status_code == 200
-    assert response.json()["service"] == "rag-mcp-service"
+    assert response.json()["service"] == "atlas-rag"
 
 
-def test_runtime_health_reports_model_state_without_loading_models() -> None:
+def test_removed_reranker_is_rejected_before_runtime(service) -> None:
+    runtime, client = service
+    response = client.post("/v1/search", headers=AUTH, json={"query": "test", "rerank": "bi_encoder"})
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body", "rerank"]
+    assert not runtime.search_arguments
+    schema = client.get("/openapi.json").json()
+    assert schema["info"]["title"] == "atlas-rag"
+    assert schema["components"]["schemas"]["SearchBody"]["properties"]["rerank"]["enum"] == ["none", "cross_encoder"]
+
+
+@pytest.mark.parametrize("rerank", ["none", "cross_encoder"])
+def test_supported_rerankers_reach_runtime(service, rerank) -> None:
+    runtime, client = service
+    response = client.post("/v1/search", headers=AUTH, json={"query": "test", "rerank": rerank})
+    assert response.status_code == 200
+    assert runtime.search_arguments[-1]["rerank"] == rerank
+
+
+def test_runtime_health_reports_http_configuration_without_calling_models() -> None:
     runtime = object.__new__(RagServiceRuntime)
     runtime.config = RagConfig(
         backend="qdrant",
@@ -89,31 +110,56 @@ def test_runtime_health_reports_model_state_without_loading_models() -> None:
         reranker_model="local/reranker",
         reranker_device="cpu",
     )
-    runtime._embedder = SimpleNamespace(is_loaded=True)
-    runtime._reranker = SimpleNamespace(is_loaded=False)
-
     status = runtime.status()
 
-    assert status["models"] == {
-        "embedding": {"name": "local/embedding", "device": "cpu", "loaded": True},
-        "reranker": {"name": "local/reranker", "device": "cpu", "loaded": False},
-    }
+    assert status["service"] == "atlas-rag"
+    assert "models" not in status
 
 
 def test_standalone_console_is_served_by_the_rag_package(service) -> None:
     _runtime, client = service
 
-    page = client.get("/")
-    script = client.get("/console/assets/app.js")
+    class Assets(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.urls = []
 
-    assert page.status_code == 200
-    assert "Atlas RAG Console" in page.text
-    assert client.get("/openapi.json").json()["info"]["title"] == "Atlas RAG Service"
-    assert script.status_code == 200
-    assert "RAG_SERVICE_URL" in script.text
-    assert "三模式对比" in page.text
-    assert "旧结果已清空" in script.text
-    assert "retrieval_score" in script.text
+        def handle_starttag(self, tag, attrs):
+            attributes = dict(attrs)
+            if tag == "script" and attributes.get("src"):
+                self.urls.append(attributes["src"])
+            if tag == "link" and attributes.get("rel") == "stylesheet":
+                self.urls.append(attributes["href"])
+
+    for url in ("/", "/console"):
+        page = client.get(url)
+        assert page.status_code == 200
+        assert "<title>atlas-rag</title>" in page.text
+        assets = Assets()
+        assets.feed(page.text)
+        assert len(assets.urls) >= 2
+        for asset in assets.urls:
+            assert asset.startswith("/console/assets/")
+            response = client.get(asset)
+            assert response.status_code == 200
+            assert response.content
+
+
+def test_remote_service_requires_explicit_mcp_allowlists(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("RAG_MCP_ALLOWED_HOSTS", raising=False)
+    monkeypatch.delenv("RAG_MCP_ALLOWED_ORIGINS", raising=False)
+    monkeypatch.setenv("RAG_SERVICE_HOST", "0.0.0.0")
+    monkeypatch.setenv("RAG_SERVICE_TOKEN", "test-token")
+
+    with pytest.raises(RagConfigError, match="RAG_MCP_ALLOWED_HOSTS"):
+        RagHttpSettings.from_env()
+
+    monkeypatch.setenv("RAG_MCP_ALLOWED_HOSTS", "rag.example.com")
+    monkeypatch.setenv("RAG_MCP_ALLOWED_ORIGINS", "https://app.example.com")
+    settings = RagHttpSettings.from_env()
+
+    assert settings.mcp_allowed_hosts == ("rag.example.com",)
+    assert settings.mcp_allowed_origins == ("https://app.example.com",)
 
 
 def test_tenant_api_requires_token_and_valid_namespace(service) -> None:
@@ -141,24 +187,39 @@ def test_upload_list_search_and_delete_use_header_namespace(service) -> None:
     deleted = client.delete("/v1/documents/manual.md", headers=AUTH)
 
     assert uploaded.status_code == 200
-    assert set(listing.json()["supported_extensions"]) == {".docx", ".md", ".pdf", ".txt"}
+    assert set(listing.json()["supported_extensions"]) == {".doc", ".docx", ".md", ".pdf", ".txt"}
     assert listing.json()["documents"][0]["name"] == "manual.md"
     assert search.json()["evidence_status"] == "no_evidence"
     assert runtime.search_arguments[0]["candidate_k"] == 10
     assert deleted.json()["documents"] == []
     assert runtime.calls == [
+        ("list", NAMESPACE),
         ("upload", NAMESPACE),
         ("list", NAMESPACE),
         ("search", NAMESPACE),
+        ("list", NAMESPACE),
         ("delete", NAMESPACE),
     ]
+
+
+def test_http_search_keeps_image_base64_for_direct_clients(service) -> None:
+    runtime, client = service
+    runtime.search_result = {
+        "query": "figure", "evidence_status": "found",
+        "results": [{"asset": {"type": "image", "mime_type": "image/png", "data": "aW1hZ2U="}}],
+    }
+
+    response = client.post("/v1/search", headers=AUTH, json={"query": "figure"})
+
+    assert response.status_code == 200
+    assert response.json()["results"][0]["asset"]["data"] == "aW1hZ2U="
 
 
 class FakeIngester:
     def __init__(self) -> None:
         self.deleted: list[str] = []
 
-    def ingest(self, path: Path, *, source_root: Path) -> IndexedDocument:
+    def ingest(self, path: Path, *, source_root: Path, chunking=None) -> IndexedDocument:
         assert path.parent == source_root
         if "FAIL_INDEX" in path.read_text(encoding="utf-8"):
             raise RuntimeError("simulated index failure")
@@ -190,8 +251,9 @@ def test_service_owned_store_accepts_document_formats_and_confines_names(tmp_pat
         ]
     )
 
+    store.validate_uploads([("legacy.doc", io.BytesIO(b"doc"))])
     with pytest.raises(KnowledgeValidationError, match="暂不支持"):
-        store.validate_uploads([("legacy.doc", io.BytesIO(b"doc"))])
+        store.validate_uploads([("unsupported.exe", io.BytesIO(b"binary"))])
 
     assert store.sanitize_name("../outside.md") == "_outside.md"
     assert store.paths.knowledge_dir in store._confined_target("safe.md").parents
